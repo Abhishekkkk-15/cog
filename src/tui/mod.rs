@@ -22,7 +22,7 @@ use crate::agent::Agent;
 use crate::memory::MemoryManager;
 use crate::provider::Provider;
 use crate::tools::ToolRegistry;
-use app::App;
+use app::{App, InputMode, PendingPrompt};
 
 const TICK_RATE: Duration = Duration::from_millis(250);
 const TOKEN_BUDGET: usize = 128_000;
@@ -65,12 +65,20 @@ pub async fn run_tui(
     let mut terminal = init_terminal()?;
 
     let agent = Agent::new(provider, tools, model.clone()).with_system_prompt(system_prompt);
-    let mut agent = if let Some(mem) = memory {
+    let agent = if let Some(mem) = memory {
         agent.with_memory(mem)
     } else {
         agent
     };
-    
+
+    // Without this, ExecutorNode's `ui_tx` stays `None` and a
+    // confirmation-gated tool call falls through to the blocking stdin
+    // prompt — which fights crossterm's raw-mode EventStream for the same
+    // input and never renders the `confirm_popup` widget at all.
+    let (agent_to_ui_tx, mut agent_to_ui_rx) = mpsc::unbounded_channel::<AgentToUi>();
+    let (_ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgent>();
+    let agent = agent.with_ui_channels(agent_to_ui_tx, ui_to_agent_rx);
+
     agent.spawn_nodes().await;
     let bus = agent.bus.clone();
     let state = agent.state.clone();
@@ -167,11 +175,25 @@ pub async fn run_tui(
             Ok(agent_event) = bus_rx.recv() => {
                 app.handle_agent_event(agent_event);
                 needs_draw = true;
-                
+
                 // Batch process any remaining events in the queue to prevent drawing after every single token
                 while let Ok(evt) = bus_rx.try_recv() {
                     app.handle_agent_event(evt);
                 }
+            }
+            Some(msg) = agent_to_ui_rx.recv() => {
+                match msg {
+                    AgentToUi::ConfirmRequest { tool_name, description, respond_to } => {
+                        app.pending_prompt = Some(PendingPrompt::Confirm { tool_name, description, respond_to });
+                        app.mode = InputMode::Confirm;
+                    }
+                    AgentToUi::AskUser { question, options, respond_to } => {
+                        app.pending_prompt = Some(PendingPrompt::Ask { question, options, respond_to });
+                        app.mode = InputMode::Confirm;
+                    }
+                    _ => {}
+                }
+                needs_draw = true;
             }
             Some(path) = fs_rx.recv() => {
                 let mut paths = vec![path];

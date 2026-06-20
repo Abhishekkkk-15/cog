@@ -105,3 +105,80 @@ async fn agent_run_reaches_run_finished_with_no_tool_calls() {
 
     assert!(success, "a no-op echo response should pass cargo check and finish successfully");
 }
+
+/// Exercises the real stdin y/N fallback in `ExecutorNode::confirm()` — the
+/// path used by `cog run` with no TUI wired (no `ui_tx`) and without
+/// `--yes`. Reads the actual process stdin rather than a mock, so it's
+/// `#[ignore]`d to avoid racing other tests for the same fd under the
+/// default parallel test runner. Run explicitly with stdin piped, e.g.:
+///   echo y | cargo test --test nodes stdin_confirmation_accepts -- --ignored --exact --nocapture
+///   echo n | cargo test --test nodes stdin_confirmation_declines -- --ignored --exact --nocapture
+async fn run_command_via_stdin_confirmation(dir: &std::path::Path) -> AgentState {
+    let tools = Arc::new(ToolRegistry::new());
+    let provider = Arc::new(DummyProvider::scripted(vec![ChatResponse {
+        message: Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: vec![ToolCall { id: "call1".into(), name: "run_command".into(), arguments: serde_json::json!({"command": "echo confirmed-run-marker"}).to_string() }],
+            tool_call_id: None,
+            name: None,
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: None,
+    }]));
+
+    let bus = EventBus::new(32);
+    let state = AgentState::new();
+    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.to_path_buf(), None, false, None);
+    let mut bus_rx = bus.subscribe();
+    let exec_rx = bus.subscribe();
+
+    let exec_bus = bus.clone();
+    let exec_state = state.clone();
+    tokio::spawn(async move { executor.start(exec_bus, exec_rx, exec_state).await });
+
+    let _ = bus.publish(Event::ContextReady("t1".into()));
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match bus_rx.recv().await {
+                Ok(Event::ExecutionFinished(_)) => break,
+                Ok(_) => continue,
+                Err(_) => panic!("bus closed before ExecutionFinished"),
+            }
+        }
+    })
+    .await
+    .expect("executor should finish within 30s — did you forget to pipe an answer into stdin?");
+
+    // The executor task loops forever waiting for the next event, so its
+    // clone of the Arc is still alive here — read out a clone instead of
+    // trying to unwrap the Arc.
+    state.read().await.clone()
+}
+
+#[tokio::test]
+#[ignore]
+async fn stdin_confirmation_accepts_when_user_types_y() {
+    let dir = tempdir().unwrap();
+    let state = run_command_via_stdin_confirmation(dir.path()).await;
+    assert!(
+        state.conversation.messages.iter().any(|m| m.content.as_deref().unwrap_or("").contains("confirmed-run-marker")),
+        "approving via stdin should have actually run the command"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn stdin_confirmation_declines_when_user_types_n() {
+    let dir = tempdir().unwrap();
+    let state = run_command_via_stdin_confirmation(dir.path()).await;
+    assert!(
+        !state.conversation.messages.iter().any(|m| m.content.as_deref().unwrap_or("").contains("confirmed-run-marker")),
+        "declining via stdin must not run the command"
+    );
+    assert!(
+        state.conversation.messages.iter().any(|m| m.content.as_deref().unwrap_or("").contains("declined")),
+        "conversation should record the decline"
+    );
+}
