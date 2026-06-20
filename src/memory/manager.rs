@@ -266,6 +266,42 @@ impl MemoryManager {
         Ok(deleted > 0)
     }
 
+    pub async fn list_facts(&self, limit: usize) -> Result<Vec<(String, String)>, MemoryError> {
+        let conn = self.conn.clone();
+        let facts = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT key, value FROM facts ORDER BY last_updated DESC LIMIT ?1")?;
+            let mut rows = stmt.query([limit as i64])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            }
+            Ok::<Vec<(String, String)>, rusqlite::Error>(out)
+        })
+        .await??;
+        Ok(facts)
+    }
+
+    pub async fn count_facts(&self) -> Result<usize, MemoryError> {
+        let conn = self.conn.clone();
+        let count = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM facts", [], |row| row.get::<_, i64>(0))
+        })
+        .await??;
+        Ok(count as usize)
+    }
+
+    pub async fn count_code_chunks(&self) -> Result<usize, MemoryError> {
+        let conn = self.conn.clone();
+        let count = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM code_chunks_meta", [], |row| row.get::<_, i64>(0))
+        })
+        .await??;
+        Ok(count as usize)
+    }
+
     /// Substring matches over `value` are ranked first (a cheap, precise
     /// signal beats embedding fuzziness for a small fact store), merged
     /// with an in-memory cosine-similarity pass — sqlite-vec KNN only

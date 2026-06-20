@@ -73,6 +73,7 @@ impl Tool for WriteFileTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
         let params: WriteFileParams = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
         let full_path = ctx.cwd.join(&params.path);
+        super::snapshot_before_write(ctx, &full_path);
         let old_lines = std::fs::read_to_string(&full_path).ok().map(|s| s.lines().count());
 
         if let Some(parent) = full_path.parent() {

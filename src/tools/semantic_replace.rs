@@ -96,6 +96,7 @@ impl Tool for SemanticReplaceTool {
         new_source.push_str(&params.new_text);
         new_source.push_str(&source[end_byte..]);
 
+        super::snapshot_before_write(ctx, &abs_path);
         std::fs::write(&abs_path, &new_source)?;
 
         Ok(format!(

@@ -40,12 +40,30 @@ pub enum ToolError {
     Io(#[from] std::io::Error),
 }
 
+/// Maps an absolute file path to its content from *before* the current run
+/// first touched it (`None` = the file didn't exist yet). Populated by
+/// `snapshot_before_write` the first time each path is written, so
+/// `RecoveryNode` can restore everything if a task ultimately fails after
+/// exhausting its retries.
+pub type FileSnapshots = Arc<std::sync::Mutex<HashMap<PathBuf, Option<Vec<u8>>>>>;
+
 /// Shared context every tool gets. `ui_tx` is only used by ask_user, which
 /// round-trips through the TUI for an interactive answer.
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub ui_tx: Option<mpsc::UnboundedSender<AgentToUi>>,
     pub memory: Option<Arc<tokio::sync::Mutex<MemoryManager>>>,
+    pub snapshots: Option<FileSnapshots>,
+}
+
+/// Records `path`'s current bytes (or `None` if it doesn't exist yet) the
+/// *first* time it's touched in a run — a no-op if `ctx.snapshots` isn't
+/// wired, or if this exact path was already snapshotted earlier in the
+/// same run (a later snapshot would capture an already-modified state,
+/// defeating the point of rolling back to the original).
+fn snapshot_before_write(ctx: &ToolContext, path: &std::path::Path) {
+    let Some(snapshots) = &ctx.snapshots else { return };
+    snapshots.lock().unwrap().entry(path.to_path_buf()).or_insert_with(|| std::fs::read(path).ok());
 }
 
 #[async_trait]

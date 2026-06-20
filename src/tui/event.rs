@@ -1,13 +1,23 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tui_input::backend::crossterm::EventHandler;
 
-use super::app::{App, Focus, InputMode, PendingPrompt, RightPanel};
+use super::app::{App, ConfirmDecision, Focus, InputMode, PendingPrompt, RightPanel};
 use super::{SlashCommand, UiToAgent};
 
 /// Translates a raw key event into an action for the agent, mutating `app`'s
 /// input/mode state along the way. Mode-aware: a plain chat prompt in Normal
 /// mode, a vim-style `:` command line, or a confirmation/ask-user response.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<UiToAgent> {
+    // On at least some Windows terminals, a single physical keypress can
+    // surface as both a Press and a Release `KeyEvent` even without the
+    // opt-in keyboard-enhancement protocol enabled. Without this guard,
+    // every binding below fires twice per press — harmless for one-shot
+    // actions, but a toggle (F2) flips on then immediately back off,
+    // looking like the panel "appeared for a millisecond then vanished".
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Some(UiToAgent::Quit);
     }
@@ -15,8 +25,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<UiToAgent> {
     match app.mode {
         InputMode::Confirm => handle_confirm_key(app, key),
         InputMode::Normal | InputMode::Command => {
-            // Ctrl+M toggles the memory inspector panel
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('m') {
+            // F2 toggles the memory inspector panel. Deliberately not a
+            // Ctrl+letter combo: in raw terminal input, Ctrl+M sends the
+            // exact same byte (\r) as plain Enter, so crossterm reports it
+            // as KeyCode::Enter, not Char('m') with CONTROL — the binding
+            // would silently never fire. Several other Ctrl combos have
+            // the same kind of legacy ASCII collision (Ctrl+I = Tab,
+            // Ctrl+H = Backspace, Ctrl+[ = Esc); a function key avoids the
+            // whole class of bug.
+            if key.code == KeyCode::F(2) {
                 match app.right_panel {
                     RightPanel::FileTree => {
                         app.right_panel = RightPanel::MemoryInspector;
@@ -67,12 +84,17 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Option<UiToAgent> {
     match pending {
         PendingPrompt::Confirm { tool_name, description, respond_to } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let _ = respond_to.send(true);
+                let _ = respond_to.send(ConfirmDecision::Once);
+                app.mode = InputMode::Normal;
+                None
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                let _ = respond_to.send(ConfirmDecision::Always);
                 app.mode = InputMode::Normal;
                 None
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                let _ = respond_to.send(false);
+                let _ = respond_to.send(ConfirmDecision::Deny);
                 app.mode = InputMode::Normal;
                 None
             }

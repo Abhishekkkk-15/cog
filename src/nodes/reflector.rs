@@ -3,7 +3,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::bus::EventBus;
 use crate::message::Message;
-use crate::nodes::Node;
+use crate::nodes::{recv_lossy, Node};
 use crate::provider::{ChatRequest, Provider, ProviderError};
 use crate::state::{AgentState, Event};
 
@@ -22,8 +22,13 @@ impl ReflectorNode {
             model: self.model.clone(),
             messages: vec![
                 Message::system(
-                    "You are debugging a failed code change. Given the verification error below, \
-                     give a concise (~100 word) diagnosis of the likely cause and a concrete next step to fix it.",
+                    "You are reviewing why a coding agent's task failed verification. The failure could be a \
+                     code/build error (a compiler or test error), or a judgment that the agent's response didn't \
+                     actually accomplish what the task asked for (e.g. it only described or talked instead of \
+                     acting, or skipped a requested step). Given the failure reason below, give a concise \
+                     (~100 word) diagnosis of why it likely happened and a concrete suggestion for what to do \
+                     differently on retry. Don't assume there's a code diff to review unless the failure reason \
+                     itself mentions one.",
                 ),
                 Message::user(error.to_string()),
             ],
@@ -41,7 +46,7 @@ impl ReflectorNode {
 #[async_trait::async_trait]
 impl Node for ReflectorNode {
     async fn start(&self, bus: EventBus, mut rx: broadcast::Receiver<Event>, _state: Arc<RwLock<AgentState>>) {
-        while let Ok(event) = rx.recv().await {
+        while let Some(event) = recv_lossy(&mut rx, "ReflectorNode").await {
             let Event::VerificationFailed { tid, error } = event else { continue };
             tracing::info!("ReflectorNode: analyzing failure for task {tid}");
 

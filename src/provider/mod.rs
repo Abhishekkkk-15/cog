@@ -5,9 +5,11 @@ pub mod mistral;
 pub mod nvidia;
 pub mod openai;
 pub mod openai_compatible;
+mod retrying;
 
 pub use dummy::DummyProvider;
 pub use openai_compatible::OpenAiCompatible;
+pub use retrying::RetryingProvider;
 
 use std::collections::BTreeMap;
 

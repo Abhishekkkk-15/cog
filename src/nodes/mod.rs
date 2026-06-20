@@ -22,3 +22,27 @@ pub trait Node: Send + Sync {
     /// missed forever.
     async fn start(&self, bus: EventBus, rx: broadcast::Receiver<Event>, state: Arc<RwLock<AgentState>>);
 }
+
+/// Receives the next event, treating a recoverable `Lagged` error as "skip
+/// and keep going" rather than fatal. Every node's loop used to be
+/// `while let Ok(event) = rx.recv().await`, which silently and
+/// *permanently* kills the node's loop on *any* `Err`, including `Lagged`
+/// — and a burst of streamed `AssistantStreaming` deltas (one event per
+/// token chunk) can easily exceed the bus's capacity for a node with
+/// nothing to do in the meantime (e.g. `VerifierNode` waiting on
+/// `ExecutionFinished` while `ExecutorNode` streams a long reply). That
+/// made it possible for a node to silently stop forever mid-run, with
+/// nothing it was responsible for ever happening again and no error
+/// logged anywhere — a real, reproducible hang, not a hypothetical one.
+pub(crate) async fn recv_lossy(rx: &mut broadcast::Receiver<Event>, node_name: &str) -> Option<Event> {
+    loop {
+        match rx.recv().await {
+            Ok(event) => return Some(event),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("{node_name}: lagged behind by {n} events on the bus, continuing");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}

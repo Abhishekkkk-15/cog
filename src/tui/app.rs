@@ -9,7 +9,7 @@ pub enum AgentToUi {
     AssistantTextDone,
     ToolCallStarted { id: String, name: String, args_preview: String },
     ToolCallFinished { id: String, result_preview: String, success: bool },
-    ConfirmRequest { tool_name: String, description: String, respond_to: oneshot::Sender<bool> },
+    ConfirmRequest { tool_name: String, description: String, respond_to: oneshot::Sender<ConfirmDecision> },
     AskUser { question: String, options: Vec<String>, respond_to: oneshot::Sender<String> },
     TokenUsageUpdate { prompt: u32, completion: u32, total: u32, budget: usize },
     ConnectionStatusChanged(ConnectionStatus),
@@ -88,8 +88,18 @@ pub enum ChatLine {
 }
 
 pub enum PendingPrompt {
-    Confirm { tool_name: String, description: String, respond_to: oneshot::Sender<bool> },
+    Confirm { tool_name: String, description: String, respond_to: oneshot::Sender<ConfirmDecision> },
     Ask { question: String, options: Vec<String>, respond_to: oneshot::Sender<String> },
+}
+
+/// A user's answer to a `ConfirmRequest`. `Always` additionally trusts the
+/// tool for the rest of this run (session-only — never persisted), so
+/// subsequent calls to the same tool skip the prompt entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmDecision {
+    Once,
+    Always,
+    Deny,
 }
 
 pub struct FileTreeEntry {

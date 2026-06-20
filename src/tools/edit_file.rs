@@ -48,6 +48,7 @@ impl Tool for EditFileTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
         let params: EditFileParams = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
         let full_path = ctx.cwd.join(&params.path);
+        super::snapshot_before_write(ctx, &full_path);
 
         let original = std::fs::read_to_string(&full_path)?;
         let uses_crlf = original.contains("\r\n");

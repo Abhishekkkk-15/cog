@@ -52,6 +52,19 @@ pub struct Context {
     pub recent_errors: Vec<String>,
 }
 
+/// Shared by `AgentState::new()` (the conversation's real budget — what
+/// `MemoryManager::compress_if_needed` checks against) and the TUI's status
+/// bar (what gets displayed). These used to be two separately-defined
+/// constants; `AgentState::default()`'s derived `Conversation::default()`
+/// silently used `token_budget: 0`, which made `compress_if_needed`'s
+/// "over 80% of budget" check always true the moment there was any
+/// conversation at all — `0 * 0.8 == 0`, and any positive token count is
+/// `> 0`. That triggered a real (LLM-call-making) summarization attempt on
+/// *every single round*, not just when actually near the limit — dormant
+/// since nothing called `compress_if_needed` until it was wired into the
+/// live executor loop.
+pub const DEFAULT_TOKEN_BUDGET: usize = 128_000;
+
 #[derive(Debug, Clone, Default)]
 pub struct AgentState {
     pub run_id: String,
@@ -65,6 +78,7 @@ impl AgentState {
     pub fn new() -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             run_id: uuid::Uuid::new_v4().to_string(),
+            conversation: crate::message::Conversation::new(DEFAULT_TOKEN_BUDGET),
             ..Default::default()
         }))
     }
@@ -84,7 +98,11 @@ pub enum Event {
     ActionRejected(String), // tool_call_id
     ActionFinished { id: String, result: String, success: bool },
     TurnComplete,
-    ExecutionFinished(String), // task_id
+    /// `made_tool_calls` lets `VerifierNode` short-circuit straight to a
+    /// failure when the model never acted at all — the same shape as the
+    /// k8s-tui bug, where "Verification passed" fired despite zero files
+    /// being created, because nothing else checked for that case.
+    ExecutionFinished { tid: String, made_tool_calls: bool },
     VerificationPassed,
     VerificationFailed { tid: String, error: String },
     ReflectionGenerated { tid: String, reflection: String },

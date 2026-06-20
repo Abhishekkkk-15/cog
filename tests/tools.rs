@@ -4,11 +4,16 @@ use tokio::sync::mpsc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use cog::tools::{ToolContext, ToolRegistry};
+use cog::tools::{FileSnapshots, ToolContext, ToolRegistry};
 use cog::tui::AgentToUi;
 
 fn ctx(cwd: std::path::PathBuf) -> ToolContext {
-    ToolContext { cwd, ui_tx: None, memory: None }
+    ToolContext { cwd, ui_tx: None, memory: None, snapshots: None }
+}
+
+fn ctx_with_snapshots(cwd: std::path::PathBuf) -> (ToolContext, FileSnapshots) {
+    let snapshots: FileSnapshots = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    (ToolContext { cwd, ui_tx: None, memory: None, snapshots: Some(snapshots.clone()) }, snapshots)
 }
 
 async fn run_git(dir: &std::path::Path, args: &[&str]) {
@@ -50,6 +55,36 @@ async fn write_file_creates_then_overwrites() {
     let overwritten = tool.execute(json!({"path": "out.txt", "content": "bye\n"}), &context).await.unwrap();
     assert!(overwritten.contains("wrote"));
     assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "bye\n");
+}
+
+/// The rollback feature (`RecoveryNode::restore_snapshots`) depends on
+/// `write_file`/`edit_file` actually recording prior content — this is the
+/// part of that mechanism that lives in the tools themselves.
+#[tokio::test]
+async fn write_file_and_edit_file_record_snapshots_for_rollback() {
+    let dir = tempdir().unwrap();
+    let registry = ToolRegistry::new();
+    let (context, snapshots) = ctx_with_snapshots(dir.path().to_path_buf());
+
+    // A brand-new file: the snapshot should record "didn't exist" (None).
+    let new_path = dir.path().join("new.txt");
+    registry.get("write_file").unwrap().execute(json!({"path": "new.txt", "content": "v1"}), &context).await.unwrap();
+    assert_eq!(snapshots.lock().unwrap().get(&new_path), Some(&None));
+
+    // An existing file: the snapshot should capture its content from
+    // *before* this run touched it, even across multiple writes.
+    let existing_path = dir.path().join("existing.txt");
+    std::fs::write(&existing_path, "original").unwrap();
+    registry.get("write_file").unwrap().execute(json!({"path": "existing.txt", "content": "v2"}), &context).await.unwrap();
+    registry.get("write_file").unwrap().execute(json!({"path": "existing.txt", "content": "v3"}), &context).await.unwrap();
+    assert_eq!(snapshots.lock().unwrap().get(&existing_path), Some(&Some(b"original".to_vec())));
+
+    // edit_file uses the same mechanism.
+    let edited_path = dir.path().join("edited.txt");
+    std::fs::write(&edited_path, "line1\nline2\n").unwrap();
+    let diff = diffy::create_patch("line1\nline2\n", "line1\nCHANGED\n").to_string();
+    registry.get("edit_file").unwrap().execute(json!({"path": "edited.txt", "diff": diff}), &context).await.unwrap();
+    assert_eq!(snapshots.lock().unwrap().get(&edited_path), Some(&Some(b"line1\nline2\n".to_vec())));
 }
 
 #[tokio::test]
@@ -243,7 +278,7 @@ async fn ask_user_round_trips_through_ui_channel() {
     let tool = registry.get("ask_user").unwrap();
 
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
-    let context = ToolContext { cwd: dir.path().to_path_buf(), ui_tx: Some(agent_tx), memory: None };
+    let context = ToolContext { cwd: dir.path().to_path_buf(), ui_tx: Some(agent_tx), memory: None, snapshots: None };
 
     let responder = tokio::spawn(async move {
         if let Some(AgentToUi::AskUser { respond_to, .. }) = agent_rx.recv().await {

@@ -3,8 +3,9 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::bus::EventBus;
 use crate::message::Message;
-use crate::nodes::Node;
+use crate::nodes::{recv_lossy, Node};
 use crate::state::{AgentState, Event, TaskStatus};
+use crate::tools::FileSnapshots;
 
 /// Maximum automatic retry attempts per task before giving up and
 /// surfacing the failure instead of looping forever.
@@ -16,12 +17,20 @@ enum RecoveryDecision {
     GiveUp,
 }
 
-pub struct RecoveryNode;
+pub struct RecoveryNode {
+    snapshots: FileSnapshots,
+}
+
+impl RecoveryNode {
+    pub fn new(snapshots: FileSnapshots) -> Self {
+        Self { snapshots }
+    }
+}
 
 #[async_trait::async_trait]
 impl Node for RecoveryNode {
     async fn start(&self, bus: EventBus, mut rx: broadcast::Receiver<Event>, state: Arc<RwLock<AgentState>>) {
-        while let Ok(event) = rx.recv().await {
+        while let Some(event) = recv_lossy(&mut rx, "RecoveryNode").await {
             let Event::ReflectionGenerated { tid, reflection } = event else { continue };
             tracing::info!("RecoveryNode: handling reflection for task {tid}");
 
@@ -35,10 +44,35 @@ impl Node for RecoveryNode {
                     let _ = bus.publish(Event::TaskStarted(tid));
                 }
                 RecoveryDecision::GiveUp => {
-                    tracing::warn!("RecoveryNode: giving up on task {tid} after exhausting retries");
+                    tracing::warn!("RecoveryNode: giving up on task {tid} after exhausting retries, restoring touched files");
+                    restore_snapshots(&self.snapshots);
                     let _ = bus.publish(Event::RunFinished(false));
                 }
             }
+        }
+    }
+}
+
+/// Restores every file the failed task(s) touched back to its pre-run
+/// state — `Some(bytes)` overwrites, `None` means the file didn't exist
+/// before and gets removed if it does now. Drains the map either way, so
+/// a restored (or not-yet-restored-because-of-an-IO-error) entry is never
+/// reapplied against a later, unrelated run.
+fn restore_snapshots(snapshots: &FileSnapshots) {
+    let entries: Vec<_> = snapshots.lock().unwrap().drain().collect();
+    for (path, prior) in entries {
+        let result = match &prior {
+            Some(bytes) => std::fs::write(&path, bytes),
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(&path)
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!("RecoveryNode: failed to roll back {}: {e}", path.display());
         }
     }
 }
@@ -108,5 +142,34 @@ mod tests {
         let mut state = state_with_task(0);
         let decision = record_attempt_and_decide(&mut state, "missing", "irrelevant");
         assert_eq!(decision, RecoveryDecision::GiveUp);
+    }
+
+    fn snapshots_with(entries: Vec<(std::path::PathBuf, Option<Vec<u8>>)>) -> FileSnapshots {
+        Arc::new(std::sync::Mutex::new(entries.into_iter().collect()))
+    }
+
+    #[test]
+    fn restore_snapshots_overwrites_a_modified_file_back_to_its_prior_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "modified by the failed attempt").unwrap();
+
+        let snapshots = snapshots_with(vec![(path.clone(), Some(b"original content".to_vec()))]);
+        restore_snapshots(&snapshots);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original content");
+        assert!(snapshots.lock().unwrap().is_empty(), "the map should be drained after restoring");
+    }
+
+    #[test]
+    fn restore_snapshots_removes_a_file_that_did_not_exist_before_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new_file.txt");
+        std::fs::write(&path, "created by the failed attempt").unwrap();
+
+        let snapshots = snapshots_with(vec![(path.clone(), None)]);
+        restore_snapshots(&snapshots);
+
+        assert!(!path.exists(), "a file that didn't exist before the run should be removed on rollback");
     }
 }

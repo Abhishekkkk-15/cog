@@ -8,7 +8,7 @@ use crate::tui::app::App;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
-        .title(" Memory Inspector (Ctrl+M) ")
+        .title(" Memory Inspector (F2) ")
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Cyan));
 

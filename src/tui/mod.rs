@@ -2,7 +2,7 @@ mod app;
 pub mod event;
 mod widgets;
 
-pub use app::{AgentToUi, ConnectionStatus, MemorySnapshot, SlashCommand, UiToAgent};
+pub use app::{AgentToUi, ConfirmDecision, ConnectionStatus, MemorySnapshot, SlashCommand, UiToAgent};
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -25,7 +25,6 @@ use crate::tools::ToolRegistry;
 use app::{App, InputMode, PendingPrompt};
 
 const TICK_RATE: Duration = Duration::from_millis(250);
-const TOKEN_BUDGET: usize = 128_000;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -65,7 +64,7 @@ pub async fn run_tui(
     let mut terminal = init_terminal()?;
 
     let agent = Agent::new(provider, tools, model.clone()).with_system_prompt(system_prompt);
-    let agent = if let Some(mem) = memory {
+    let agent = if let Some(mem) = memory.clone() {
         agent.with_memory(mem)
     } else {
         agent
@@ -88,7 +87,7 @@ pub async fn run_tui(
     });
 
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut app = App::new(root.clone(), model, provider_name, TOKEN_BUDGET, bus.clone(), state.clone());
+    let mut app = App::new(root.clone(), model, provider_name, crate::state::DEFAULT_TOKEN_BUDGET, bus.clone(), state.clone());
 
     if let Some(prompt) = initial_prompt {
         app.push_user_line(prompt.clone());
@@ -155,12 +154,71 @@ pub async fn run_tui(
                                             app.status.model = new_model.clone();
                                             app.lines.push(crate::tui::app::ChatLine::SystemNote(format!("Switched model to '{}'. Note: This requires restart in the current architecture.", new_model)));
                                         }
+                                        SlashCommand::MemoryStats => {
+                                            match &memory {
+                                                Some(mem) => {
+                                                    let mem = mem.lock().await;
+                                                    match (mem.count_facts().await, mem.count_code_chunks().await) {
+                                                        (Ok(facts), Ok(chunks)) => {
+                                                            app.lines.push(crate::tui::app::ChatLine::SystemNote(format!("Memory: {facts} facts, {chunks} indexed code chunks")));
+                                                        }
+                                                        _ => app.lines.push(crate::tui::app::ChatLine::SystemNote("Failed to read memory stats".into())),
+                                                    }
+                                                }
+                                                None => app.lines.push(crate::tui::app::ChatLine::SystemNote("Memory is not configured".into())),
+                                            }
+                                        }
+                                        SlashCommand::Forget(key) => {
+                                            match &memory {
+                                                Some(mem) => {
+                                                    let mem = mem.lock().await;
+                                                    match mem.delete_fact(&key).await {
+                                                        Ok(true) => app.lines.push(crate::tui::app::ChatLine::SystemNote(format!("Forgot fact '{key}'"))),
+                                                        Ok(false) => app.lines.push(crate::tui::app::ChatLine::SystemNote(format!("No fact named '{key}' found"))),
+                                                        Err(e) => app.lines.push(crate::tui::app::ChatLine::SystemNote(format!("Failed to forget '{key}': {e}"))),
+                                                    }
+                                                }
+                                                None => app.lines.push(crate::tui::app::ChatLine::SystemNote("Memory is not configured".into())),
+                                            }
+                                        }
+                                        SlashCommand::SessionResume(id) => {
+                                            match &memory {
+                                                Some(mem) => {
+                                                    let mem = mem.lock().await;
+                                                    match mem.load_recent(&id, 50).await {
+                                                        Ok(messages) => {
+                                                            let mut st = state.write().await;
+                                                            let system_msg = st.conversation.messages.first().filter(|m| m.role == crate::message::Role::System).cloned();
+                                                            let mut new_messages = Vec::new();
+                                                            if let Some(sys) = system_msg {
+                                                                new_messages.push(sys);
+                                                            }
+                                                            new_messages.extend(messages);
+                                                            st.conversation.messages = new_messages;
+                                                            st.conversation.recompute_estimate();
+                                                            drop(st);
+                                                            app.lines.push(crate::tui::app::ChatLine::SystemNote(format!("Resumed session '{id}'")));
+                                                        }
+                                                        Err(e) => app.lines.push(crate::tui::app::ChatLine::SystemNote(format!("Failed to resume session '{id}': {e}"))),
+                                                    }
+                                                }
+                                                None => app.lines.push(crate::tui::app::ChatLine::SystemNote("Memory is not configured".into())),
+                                            }
+                                        }
                                         _ => {
                                             app.lines.push(crate::tui::app::ChatLine::SystemNote("Command not yet supported in Phase 4".into()));
                                         }
                                     }
                                 }
-                                UiToAgent::RequestMemorySnapshot => {},
+                                UiToAgent::RequestMemorySnapshot => {
+                                    if let Some(mem) = &memory {
+                                        let mem = mem.lock().await;
+                                        let facts = mem.list_facts(20).await.unwrap_or_default();
+                                        let sessions = mem.list_sessions().await.unwrap_or_default().into_iter().map(|s| (s.id, s.project_root, s.created_at)).collect();
+                                        let code_chunks_count = mem.count_code_chunks().await.unwrap_or(0);
+                                        app.memory_snapshot = Some(MemorySnapshot { facts, sessions, code_chunks_count });
+                                    }
+                                },
                                 _ => {}
                             }
                         }
@@ -176,9 +234,17 @@ pub async fn run_tui(
                 app.handle_agent_event(agent_event);
                 needs_draw = true;
 
-                // Batch process any remaining events in the queue to prevent drawing after every single token
-                while let Ok(evt) = bus_rx.try_recv() {
-                    app.handle_agent_event(evt);
+                // Batch process any remaining events in the queue to prevent
+                // drawing after every single token. `Lagged` is recoverable
+                // (this receiver fell behind, not that the bus is gone) —
+                // keep draining instead of stopping early and leaving later
+                // events to wait for the next outer-loop tick.
+                loop {
+                    match bus_rx.try_recv() {
+                        Ok(evt) => app.handle_agent_event(evt),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
                 }
             }
             Some(msg) = agent_to_ui_rx.recv() => {

@@ -35,8 +35,13 @@ soon as you stop calling tools.";
 
 fn build_provider(config: &Config) -> Result<Box<dyn Provider>> {
     let name = config.defaults.provider.as_str();
+    // Dummy is for tests/scripting — its exact response sequencing matters,
+    // so it skips the retry wrapper entirely. Every real backend gets it,
+    // since none of them retry transient errors (429/5xx) on their own.
+    if name == "dummy" {
+        return Ok(Box::new(DummyProvider::echo()));
+    }
     let provider: Box<dyn Provider> = match name {
-        "dummy" => Box::new(DummyProvider::echo()),
         "mistral" => Box::new(provider::mistral::build(&config.resolve_provider("mistral")?)),
         "groq" => Box::new(provider::groq::build(&config.resolve_provider("groq")?)),
         "nvidia" => Box::new(provider::nvidia::build(&config.resolve_provider("nvidia")?)),
@@ -44,7 +49,7 @@ fn build_provider(config: &Config) -> Result<Box<dyn Provider>> {
         "custom" => Box::new(provider::custom::build(&config.resolve_provider("custom")?)?),
         other => return Err(CogError::Config(format!("unknown provider '{other}' (expected one of: dummy, mistral, groq, nvidia, openai, custom)"))),
     };
-    Ok(provider)
+    Ok(Box::new(provider::RetryingProvider::new(provider)))
 }
 
 /// Builds a `MemoryManager` backed by `MistralEmbedder` if the mistral

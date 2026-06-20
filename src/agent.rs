@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -89,9 +90,23 @@ impl Agent {
     pub async fn spawn_nodes(&self) {
         use crate::nodes::{planner::PlannerNode, context::ContextNode, executor::ExecutorNode, verifier::VerifierNode, reflector::ReflectorNode, recovery::RecoveryNode, Node};
 
+        // Session-only "always allow" trust set, recreated fresh each time
+        // spawn_nodes() runs (once per process invocation) — never persisted.
+        let trusted = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        // Shared between ExecutorNode (records) and RecoveryNode (restores
+        // and drains on a give-up) — see `crate::tools::FileSnapshots`.
+        let snapshots: crate::tools::FileSnapshots = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+        if let Some(memory) = &self.memory {
+            let run_id = self.state.read().await.run_id.clone();
+            let mem = memory.lock().await;
+            let _ = mem.create_session(&run_id, &self.cwd.to_string_lossy()).await;
+        }
+
         let nodes: Vec<Box<dyn Node>> = vec![
-            Box::new(PlannerNode),
-            Box::new(ContextNode),
+            Box::new(PlannerNode::new(self.provider.clone(), self.model.clone())),
+            Box::new(ContextNode::new(self.memory.clone())),
             Box::new(ExecutorNode::new(
                 self.provider.clone(),
                 self.tools.clone(),
@@ -100,10 +115,12 @@ impl Agent {
                 self.ui_tx.clone(),
                 self.auto_approve,
                 self.memory.clone(),
+                trusted,
+                snapshots.clone(),
             )),
-            Box::new(VerifierNode::new(self.cwd.clone())),
+            Box::new(VerifierNode::new(self.cwd.clone(), self.provider.clone(), self.model.clone())),
             Box::new(ReflectorNode::new(self.provider.clone(), self.model.clone())),
-            Box::new(RecoveryNode),
+            Box::new(RecoveryNode::new(snapshots)),
         ];
 
         for node in nodes {

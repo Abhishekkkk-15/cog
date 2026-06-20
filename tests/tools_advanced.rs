@@ -4,7 +4,7 @@ use cog::memory::MemoryManager;
 use cog::tools::{ToolContext, ToolRegistry};
 
 fn ctx(cwd: std::path::PathBuf) -> ToolContext {
-    ToolContext { cwd, ui_tx: None, memory: None }
+    ToolContext { cwd, ui_tx: None, memory: None, snapshots: None }
 }
 
 struct SimpleMockEmbedder;

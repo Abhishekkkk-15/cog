@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -20,9 +22,17 @@ pub struct OpenAiCompatible {
     provider_name: String,
 }
 
+/// Generous enough not to interrupt a legitimately long streamed response,
+/// but bounds what was otherwise an unbounded wait: the default
+/// `reqwest::Client` has no timeout at all, so a stalled connection (a
+/// dropped packet, a server that goes quiet mid-stream) blocked forever
+/// with zero CPU usage — indistinguishable from a real deadlock.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl OpenAiCompatible {
     pub fn new(provider_name: impl Into<String>, base_url: impl Into<String>, api_key: Option<String>, quirks: ProviderQuirks) -> Self {
-        OpenAiCompatible { client: reqwest::Client::new(), base_url: base_url.into(), api_key, quirks, provider_name: provider_name.into() }
+        let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build().expect("reqwest client with a timeout should always build");
+        OpenAiCompatible { client, base_url: base_url.into(), api_key, quirks, provider_name: provider_name.into() }
     }
 
     fn endpoint(&self) -> String {

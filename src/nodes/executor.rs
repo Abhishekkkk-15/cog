@@ -1,15 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 
 use crate::bus::EventBus;
 use crate::memory::MemoryManager;
 use crate::message::{Message, Role, ToolCall};
-use crate::nodes::Node;
+use crate::nodes::{recv_lossy, Node};
 use crate::provider::{ChatRequest, Provider, StreamEvent};
 use crate::state::{AgentState, Event};
-use crate::tools::{ToolContext, ToolRegistry};
-use crate::tui::AgentToUi;
+use crate::tools::{FileSnapshots, ToolContext, ToolRegistry};
+use crate::tui::{AgentToUi, ConfirmDecision};
 
 pub struct ExecutorNode {
     provider: Arc<dyn Provider>,
@@ -19,6 +19,15 @@ pub struct ExecutorNode {
     ui_tx: Option<mpsc::UnboundedSender<AgentToUi>>,
     auto_approve: bool,
     memory: Option<Arc<tokio::sync::Mutex<MemoryManager>>>,
+    /// Tool names the user has answered "always" for — session-only
+    /// (never persisted), shared so the trust sticks for the rest of this
+    /// run regardless of which task is currently executing.
+    trusted: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Shared with `RecoveryNode`, which restores from and drains this on
+    /// a give-up. Cleared here on `RunFinished` (success or failure) so a
+    /// finished run's snapshots never bleed into the next prompt in a
+    /// long-lived TUI session.
+    snapshots: FileSnapshots,
 }
 
 impl ExecutorNode {
@@ -30,34 +39,40 @@ impl ExecutorNode {
         ui_tx: Option<mpsc::UnboundedSender<AgentToUi>>,
         auto_approve: bool,
         memory: Option<Arc<tokio::sync::Mutex<MemoryManager>>>,
+        trusted: Arc<std::sync::Mutex<HashSet<String>>>,
+        snapshots: FileSnapshots,
     ) -> Self {
-        Self { provider, tools, model, cwd, ui_tx, auto_approve, memory }
+        Self { provider, tools, model, cwd, ui_tx, auto_approve, memory, trusted, snapshots }
     }
 
     /// Confirmation round-trip: via the TUI channel if wired, otherwise
     /// auto-approve (`--yes`) or an interactive stdin prompt. Mirrors the
-    /// pre-migration `Agent::confirm()`.
-    async fn confirm(&self, tool_name: &str, description: String) -> bool {
+    /// pre-migration `Agent::confirm()`, extended with an "always" answer.
+    async fn confirm(&self, tool_name: &str, description: String) -> ConfirmDecision {
         if let Some(ui_tx) = &self.ui_tx {
             let (tx, rx) = oneshot::channel();
             let sent = ui_tx.send(AgentToUi::ConfirmRequest { tool_name: tool_name.to_string(), description, respond_to: tx });
             if sent.is_err() {
-                return false;
+                return ConfirmDecision::Deny;
             }
-            return rx.await.unwrap_or(false);
+            return rx.await.unwrap_or(ConfirmDecision::Deny);
         }
 
         if self.auto_approve {
-            return true;
+            return ConfirmDecision::Once;
         }
 
-        print!("Allow tool '{tool_name}' to run?\n{description}\n[y/N] ");
+        print!("Allow tool '{tool_name}' to run?\n{description}\n[y/a/N] ");
         let _ = std::io::Write::flush(&mut std::io::stdout());
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_ok() {
-            matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+            match line.trim().to_lowercase().as_str() {
+                "y" | "yes" => ConfirmDecision::Once,
+                "a" | "always" => ConfirmDecision::Always,
+                _ => ConfirmDecision::Deny,
+            }
         } else {
-            false
+            ConfirmDecision::Deny
         }
     }
 }
@@ -67,17 +82,32 @@ const MAX_ROUNDS: usize = 15;
 #[async_trait::async_trait]
 impl Node for ExecutorNode {
     async fn start(&self, bus: EventBus, mut rx: broadcast::Receiver<Event>, state: Arc<RwLock<AgentState>>) {
-        while let Ok(event) = rx.recv().await {
+        let session_id = state.read().await.run_id.clone();
+
+        while let Some(event) = recv_lossy(&mut rx, "ExecutorNode").await {
+            if matches!(event, Event::RunFinished(_)) {
+                self.snapshots.lock().unwrap().clear();
+                continue;
+            }
             let Event::ContextReady(tid) = event else { continue };
             tracing::info!("ExecutorNode: ContextReady received for task {tid}, running ReAct loop");
 
             let mut round = 0;
+            let mut made_tool_calls = false;
             loop {
                 if round >= MAX_ROUNDS {
                     tracing::warn!("ExecutorNode: max rounds ({MAX_ROUNDS}) exceeded for task {tid}, finishing anyway");
                     break;
                 }
                 round += 1;
+
+                // Summarize the middle of the conversation once it's grown
+                // large enough, before spending tokens on this round's request.
+                if let Some(memory) = &self.memory {
+                    let mem = memory.lock().await;
+                    let mut st = state.write().await;
+                    let _ = mem.compress_if_needed(&mut st.conversation, &*self.provider, &self.model).await;
+                }
 
                 // 1. Build request from state.conversation
                 let req = {
@@ -127,34 +157,47 @@ impl Node for ExecutorNode {
                 let tool_calls: Vec<ToolCall> = tool_calls_acc.into_values().map(|(id, name, arguments)| ToolCall { id, name, arguments }).collect();
 
                 // 2. Append Assistant's turn to conversation
+                let assistant_msg = Message {
+                    role: Role::Assistant,
+                    content: if content.is_empty() { None } else { Some(content) },
+                    tool_calls: tool_calls.clone(),
+                    tool_call_id: None,
+                    name: None,
+                };
                 {
                     let mut st = state.write().await;
-                    let final_content = if content.is_empty() { None } else { Some(content) };
-                    st.conversation.push(Message {
-                        role: Role::Assistant,
-                        content: final_content,
-                        tool_calls: tool_calls.clone(),
-                        tool_call_id: None,
-                        name: None,
-                    });
+                    st.conversation.push(assistant_msg.clone());
+                }
+                if let Some(memory) = &self.memory {
+                    let mem = memory.lock().await;
+                    let _ = mem.save_message(&session_id, &assistant_msg).await;
                 }
 
                 if tool_calls.is_empty() {
                     break;
                 }
+                made_tool_calls = true;
 
                 // 3. Process each tool call
-                let ctx = ToolContext { cwd: self.cwd.clone(), ui_tx: self.ui_tx.clone(), memory: self.memory.clone() };
+                let ctx = ToolContext { cwd: self.cwd.clone(), ui_tx: self.ui_tx.clone(), memory: self.memory.clone(), snapshots: Some(self.snapshots.clone()) };
                 for call in &tool_calls {
                     let _ = bus.publish(Event::ActionProposed { call: call.clone() });
 
                     let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
                     let tool = self.tools.get(&call.name);
+                    let already_trusted = self.trusted.lock().unwrap().contains(&call.name);
 
                     let approved = match tool {
-                        Some(t) if t.requires_confirmation() => {
+                        Some(t) if t.requires_confirmation() && !already_trusted => {
                             let description = t.confirmation_description(&args, &ctx);
-                            self.confirm(&call.name, description).await
+                            match self.confirm(&call.name, description).await {
+                                ConfirmDecision::Once => true,
+                                ConfirmDecision::Always => {
+                                    self.trusted.lock().unwrap().insert(call.name.clone());
+                                    true
+                                }
+                                ConfirmDecision::Deny => false,
+                            }
                         }
                         _ => true,
                     };
@@ -177,15 +220,20 @@ impl Node for ExecutorNode {
                     let _ = bus.publish(Event::ActionFinished { id: call.id.clone(), result: result_str.clone(), success });
 
                     // Push tool result
+                    let tool_msg = Message::tool_result(call.id.clone(), call.name.clone(), result_str);
                     {
                         let mut st = state.write().await;
-                        st.conversation.push(Message::tool_result(call.id.clone(), call.name.clone(), result_str));
+                        st.conversation.push(tool_msg.clone());
+                    }
+                    if let Some(memory) = &self.memory {
+                        let mem = memory.lock().await;
+                        let _ = mem.save_message(&session_id, &tool_msg).await;
                     }
                 }
             }
 
             let _ = bus.publish(Event::TurnComplete);
-            let _ = bus.publish(Event::ExecutionFinished(tid));
+            let _ = bus.publish(Event::ExecutionFinished { tid, made_tool_calls });
         }
     }
 }
