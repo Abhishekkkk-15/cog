@@ -7,7 +7,7 @@ Following a review of cog's agent loop against Claude Code's capabilities, three
 2. Surface the decomposed plan to the user before execution starts (Plan Mode parity)
 3. Enrich `SYSTEM_PROMPT` with engineering-practice guidance
 
-This file tracks scope, rationale, and status for each. **Status: planning only — no code changes made yet.**
+This file tracks scope, rationale, and status for each.
 
 ---
 
@@ -23,7 +23,7 @@ This file tracks scope, rationale, and status for each. **Status: planning only 
 - Remove the now-unused `diffy` dependency from `Cargo.toml`.
 - Rewrite `tests/tools.rs`'s `edit_file_*` tests for the new params; add coverage for the "not found" and "ambiguous match" error cases.
 
-**Status:** Not started.
+**Status:** Done. `src/tools/edit_file.rs` rewritten, `diffy` removed from `Cargo.toml`, tests updated.
 
 ---
 
@@ -31,9 +31,11 @@ This file tracks scope, rationale, and status for each. **Status: planning only 
 
 **Problem:** `PlannerNode` decomposes a goal into a task list and `ExecutorNode` starts executing the first task immediately — the user never sees the plan or gets a chance to redirect it before tool calls start happening.
 
-**Open question (pending input):** should execution actually *block* until the plan is approved — a y/n-style gate, mirroring the existing tool-confirmation flow — or just *display* the plan as a heads-up while proceeding automatically? This changes the implementation shape (a new confirmation round-trip vs. a one-way notification) and isn't decided yet.
+**Decision:** heads-up display only, not a blocking gate — execution proceeds automatically as before; the user can already interrupt via Ctrl+C if the plan looks wrong.
 
-**Status:** Blocked on the above design decision.
+**Implementation:** `App::handle_agent_event` (`src/tui/app.rs`) now handles `Event::PlanCreated` by best-effort `try_read`-ing the just-built milestone's task list out of shared state and pushing it into the chat panel as `SystemNote` lines. No new bus events, no round-trip, no headless-mode behavior change.
+
+**Status:** Done.
 
 ---
 

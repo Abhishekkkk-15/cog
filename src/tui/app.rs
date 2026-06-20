@@ -274,6 +274,19 @@ impl App {
                 self.streaming_assistant_index = None;
                 self.status.connection = ConnectionStatus::Idle;
             }
+            crate::state::Event::PlanCreated => {
+                // Best-effort: PlannerNode already released the write lock
+                // before publishing this event, so try_read should succeed;
+                // if it doesn't, skipping the heads-up display isn't fatal.
+                if let Ok(st) = self.state.try_read() {
+                    if let Some(milestone) = st.plan.milestones.last() {
+                        self.lines.push(ChatLine::SystemNote("Plan:".to_string()));
+                        for (i, task) in milestone.tasks.iter().enumerate() {
+                            self.lines.push(ChatLine::SystemNote(format!("  {}. {}", i + 1, task.description)));
+                        }
+                    }
+                }
+            }
             crate::state::Event::TaskStarted(tid) => {
                 self.lines.push(ChatLine::SystemNote(format!("Starting task: {}", tid)));
             }

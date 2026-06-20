@@ -126,6 +126,11 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Option<UiToAgent> {
     }
 }
 
+/// Lines scrolled per PageUp/PageDown press. `App` doesn't track the chat
+/// panel's actual rendered height (key handling only sees `app`, not frame
+/// size), so this is a fixed approximation rather than a true page jump.
+const PAGE_SCROLL_LINES: usize = 10;
+
 fn handle_text_key(app: &mut App, key: KeyEvent) -> Option<UiToAgent> {
     match key.code {
         KeyCode::Up => {
@@ -134,6 +139,14 @@ fn handle_text_key(app: &mut App, key: KeyEvent) -> Option<UiToAgent> {
         }
         KeyCode::Down => {
             app.scroll_down(1);
+            None
+        }
+        KeyCode::PageUp => {
+            app.scroll_up(PAGE_SCROLL_LINES);
+            None
+        }
+        KeyCode::PageDown => {
+            app.scroll_down(PAGE_SCROLL_LINES);
             None
         }
         KeyCode::Enter => {
