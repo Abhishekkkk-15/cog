@@ -123,14 +123,20 @@ impl Node for VerifierNode {
                 continue;
             }
 
-            if let Some(command) = self.override_command.clone().or_else(|| detect_verify_command(&self.cwd)) {
-                tracing::info!("VerifierNode: running '{command}' to verify task {tid}");
-                if let Err(error) = run_verification(&self.cwd, &command).await {
-                    let _ = bus.publish(Event::VerificationFailed { tid, error });
-                    continue;
+            // A turn with no tool calls touched no files, so a build/check
+            // command has nothing to catch — skip straight to the
+            // goal-completion judgment instead of waiting on (and risking a
+            // timeout from) a verify command that can't possibly fail.
+            if made_tool_calls {
+                if let Some(command) = self.override_command.clone().or_else(|| detect_verify_command(&self.cwd)) {
+                    tracing::info!("VerifierNode: running '{command}' to verify task {tid}");
+                    if let Err(error) = run_verification(&self.cwd, &command).await {
+                        let _ = bus.publish(Event::VerificationFailed { tid, error });
+                        continue;
+                    }
+                } else {
+                    tracing::info!("VerifierNode: no recognized project marker in {}, skipping build check for task {tid}", self.cwd.display());
                 }
-            } else {
-                tracing::info!("VerifierNode: no recognized project marker in {}, skipping build check for task {tid}", self.cwd.display());
             }
 
             let (task_description, actions_summary) = {
@@ -344,5 +350,42 @@ mod tests {
             node.judge_goal_completion("write a second file", false, "[assistant] Both files were already created in the previous step.").await,
             None
         );
+    }
+
+    /// The exact regression this guards against: a purely conversational
+    /// turn (no tool calls, so no file could have changed) used to still
+    /// wait on a real build/check command — wasteful at best, and a
+    /// frequent source of phantom "verification timed out" failures on
+    /// slow/cold toolchains at worst. The override command here would fail
+    /// immediately if invoked, proving it never ran.
+    #[tokio::test]
+    async fn start_skips_the_build_check_when_no_tool_calls_were_made() {
+        let bus = EventBus::new(32);
+        let state = AgentState::new();
+        state.write().await.conversation.push(Message { role: Role::Assistant, content: Some("hi there".into()), tool_calls: vec![], tool_call_id: None, name: None });
+
+        let node = VerifierNode::with_command(std::env::temp_dir(), scripted("PASS"), "test-model".into(), "false");
+        let mut bus_rx = bus.subscribe();
+        let node_rx = bus.subscribe();
+        let node_bus = bus.clone();
+        let node_state = state.clone();
+        tokio::spawn(async move { node.start(node_bus, node_rx, node_state).await });
+
+        let _ = bus.publish(Event::ExecutionFinished { tid: "t1".into(), made_tool_calls: false });
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match bus_rx.recv().await {
+                    Ok(Event::VerificationPassed) => break true,
+                    Ok(Event::VerificationFailed { .. }) => break false,
+                    Ok(_) => continue,
+                    Err(_) => panic!("bus closed before a verification outcome"),
+                }
+            }
+        })
+        .await
+        .expect("verifier should finish within 5s");
+
+        assert!(outcome, "a no-tool-call turn should pass verification without running the (failing) override command");
     }
 }
