@@ -31,7 +31,12 @@ When asked to build, create, fix, or modify something, actually do it using the 
 or propose steps in prose. A reply with no tool calls ends the task immediately, so writing a plan instead of executing it means \
 nothing actually gets built. Take action by default. If you genuinely need to ask the user something before proceeding, use the \
 ask_user tool rather than ending your reply with a question — a plain-text question will not be answered, since the task ends as \
-soon as you stop calling tools.";
+soon as you stop calling tools.\n\n\
+Match the existing code: before writing, check how the surrounding file and project already do things — naming, formatting, \
+error handling, which libraries are already a dependency — and follow that over your own default style. Don't add \
+abstractions, configuration options, or features beyond what was actually asked for; a bug fix doesn't need a refactor, and a \
+one-off script doesn't need a reusable helper. Don't write comments that just restate what the code already says — only \
+add one when it explains a non-obvious why (a workaround, a hidden constraint, a subtle invariant).";
 
 fn build_provider(config: &Config) -> Result<Box<dyn Provider>> {
     let name = config.defaults.provider.as_str();

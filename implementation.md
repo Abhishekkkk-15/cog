@@ -49,4 +49,4 @@ This file tracks scope, rationale, and status for each.
 - Add guidance against unnecessary comments (explain *why* something non-obvious is done, not *what* the code already says).
 - Purely additive — the existing action-oriented instructions stay as-is.
 
-**Status:** Not started.
+**Status:** Done. `SYSTEM_PROMPT` in `src/lib.rs` extended with a paragraph covering all three points; the original action-oriented text is unchanged.
