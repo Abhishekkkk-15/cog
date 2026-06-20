@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/USE05/AppData/Local/Temp/claude/D--js-cog/15205d04-b025-4baf-82b7-21408ff29519/tasks//**)",
+      "Read(//c/Users/USE05/AppData/Local/Temp/claude/D--js-cog/15205d04-b025-4baf-82b7-21408ff29519/tasks/**)"
+    ]
+  }
+}
