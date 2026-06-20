@@ -82,8 +82,12 @@ async fn write_file_and_edit_file_record_snapshots_for_rollback() {
     // edit_file uses the same mechanism.
     let edited_path = dir.path().join("edited.txt");
     std::fs::write(&edited_path, "line1\nline2\n").unwrap();
-    let diff = diffy::create_patch("line1\nline2\n", "line1\nCHANGED\n").to_string();
-    registry.get("edit_file").unwrap().execute(json!({"path": "edited.txt", "diff": diff}), &context).await.unwrap();
+    registry
+        .get("edit_file")
+        .unwrap()
+        .execute(json!({"path": "edited.txt", "old_string": "line2", "new_string": "CHANGED"}), &context)
+        .await
+        .unwrap();
     assert_eq!(snapshots.lock().unwrap().get(&edited_path), Some(&Some(b"line1\nline2\n".to_vec())));
 }
 
@@ -101,19 +105,18 @@ async fn write_file_confirmation_description_shows_a_diff() {
 }
 
 #[tokio::test]
-async fn edit_file_applies_multi_hunk_diff() {
+async fn edit_file_replaces_a_unique_match() {
     let dir = tempdir().unwrap();
     let old = "line1\nline2\nline3\nline4\nline5\n";
-    let new = "line1\nCHANGED\nline3\nline4\nADDED\nline5\n";
+    let new = "line1\nCHANGED\nline3\nline4\nline5\n";
     std::fs::write(dir.path().join("f.txt"), old).unwrap();
 
-    let diff = diffy::create_patch(old, new).to_string();
     let registry = ToolRegistry::new();
     let tool = registry.get("edit_file").unwrap();
     let context = ctx(dir.path().to_path_buf());
 
-    let result = tool.execute(json!({"path": "f.txt", "diff": diff}), &context).await.unwrap();
-    assert!(result.contains("applied diff"));
+    let result = tool.execute(json!({"path": "f.txt", "old_string": "line2", "new_string": "CHANGED"}), &context).await.unwrap();
+    assert!(result.contains("edited"));
     assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), new);
 }
 
@@ -125,30 +128,41 @@ async fn edit_file_preserves_crlf_line_endings() {
     let old_crlf = old_lf.replace('\n', "\r\n");
     std::fs::write(dir.path().join("f.txt"), &old_crlf).unwrap();
 
-    let diff = diffy::create_patch(old_lf, new_lf).to_string();
     let registry = ToolRegistry::new();
     let tool = registry.get("edit_file").unwrap();
     let context = ctx(dir.path().to_path_buf());
 
-    tool.execute(json!({"path": "f.txt", "diff": diff}), &context).await.unwrap();
+    tool.execute(json!({"path": "f.txt", "old_string": "line2", "new_string": "CHANGED"}), &context).await.unwrap();
     let result = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
     assert_eq!(result, new_lf.replace('\n', "\r\n"));
 }
 
 #[tokio::test]
-async fn edit_file_rejects_a_diff_that_does_not_apply() {
+async fn edit_file_rejects_a_string_not_found_in_the_file() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("f.txt"), "actual content here\n").unwrap();
 
-    // A diff generated against completely different content won't match
-    // the file's context lines.
-    let diff = diffy::create_patch("totally different\nbase content\n", "totally different\nedited content\n").to_string();
     let registry = ToolRegistry::new();
     let tool = registry.get("edit_file").unwrap();
     let context = ctx(dir.path().to_path_buf());
 
-    let result = tool.execute(json!({"path": "f.txt", "diff": diff}), &context).await;
-    assert!(result.is_err(), "a non-matching diff should fail to apply");
+    let result = tool.execute(json!({"path": "f.txt", "old_string": "not present", "new_string": "x"}), &context).await;
+    let err = result.expect_err("a non-matching old_string should fail");
+    assert!(err.to_string().contains("not found"));
+}
+
+#[tokio::test]
+async fn edit_file_rejects_an_ambiguous_match() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), "dup\ndup\n").unwrap();
+
+    let registry = ToolRegistry::new();
+    let tool = registry.get("edit_file").unwrap();
+    let context = ctx(dir.path().to_path_buf());
+
+    let result = tool.execute(json!({"path": "f.txt", "old_string": "dup", "new_string": "x"}), &context).await;
+    let err = result.expect_err("a match occurring twice should fail");
+    assert!(err.to_string().contains("multiple"));
 }
 
 #[tokio::test]

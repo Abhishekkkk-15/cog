@@ -38,7 +38,6 @@ tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 tree-sitter-javascript = "0.25"
-diffy = "0.5"
 # Pinned below 0.38+'s libsqlite3-sys, whose build script uses the unstable
 # `cfg_select!` macro and fails to compile on stable rustc 1.94.
 rusqlite = { version = "0.32", features = ["bundled"] }
