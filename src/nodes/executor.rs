@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use futures_util::future::join_all;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 
 use crate::bus::EventBus;
@@ -81,6 +82,58 @@ impl ExecutorNode {
         } else {
             ConfirmDecision::Deny
         }
+    }
+
+    /// Whether `name` needs the TUI's single `pending_prompt` slot before
+    /// it can run — confirmation-gated tools obviously do, but so does
+    /// `ask_user`: it round-trips through the same slot via a different
+    /// message variant, and running two of either concurrently would let
+    /// the second overwrite the first before the user could answer it.
+    fn needs_ui_turn(&self, name: &str) -> bool {
+        self.tools.requires_confirmation(name) || name == "ask_user"
+    }
+
+    /// Runs one tool call end to end — confirmation (if needed and not
+    /// already trusted), execution, and the approved/rejected event — and
+    /// returns its result string and whether it succeeded. Pulled out of
+    /// the round loop so it can be driven either concurrently (via
+    /// `join_all`, for calls that don't need a UI turn) or one at a time.
+    async fn run_tool_call(&self, call: &ToolCall, ctx: &ToolContext, bus: &EventBus) -> (String, bool) {
+        let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        let tool = self.tools.get(&call.name);
+        let already_trusted = self.trusted.lock().unwrap().contains(&call.name);
+
+        let approved = match tool {
+            Some(t) if t.requires_confirmation() && !already_trusted => {
+                let description = t.confirmation_description(&args, ctx);
+                match self.confirm(&call.name, description).await {
+                    ConfirmDecision::Once => true,
+                    ConfirmDecision::Always => {
+                        self.trusted.lock().unwrap().insert(call.name.clone());
+                        true
+                    }
+                    ConfirmDecision::Deny => false,
+                }
+            }
+            _ => true,
+        };
+
+        let result_str = if !approved {
+            let _ = bus.publish(Event::ActionRejected(call.id.clone()));
+            format!("User declined to run tool '{}'.", call.name)
+        } else {
+            let _ = bus.publish(Event::ActionApproved(call.id.clone()));
+            match tool {
+                Some(t) => match t.execute(args, ctx).await {
+                    Ok(res) => res,
+                    Err(e) => format!("Error executing {}: {}", call.name, e),
+                },
+                None => format!("Error: tool {} not found", call.name),
+            }
+        };
+
+        let success = approved && !result_str.starts_with("Error");
+        (result_str, success)
     }
 }
 
@@ -202,48 +255,38 @@ impl Node for ExecutorNode {
                 }
                 made_tool_calls = true;
 
-                // 3. Process each tool call
+                // 3. Process each tool call. Calls that don't need the
+                // TUI's UI turn (no confirmation, not ask_user) run
+                // concurrently — independent reads/searches no longer wait
+                // on each other one at a time. Calls that do need one still
+                // run sequentially, one prompt at a time. Every tool that
+                // currently mutates files (write_file/edit_file/
+                // semantic_replace) or runs a command also requires
+                // confirmation, so this split additionally means no two
+                // file-mutating calls in the same round can race each other.
                 let ctx = ToolContext { cwd: self.cwd.clone(), ui_tx: self.ui_tx.clone(), memory: self.memory.clone(), snapshots: Some(self.snapshots.clone()) };
                 for call in &tool_calls {
                     let _ = bus.publish(Event::ActionProposed { call: call.clone() });
+                }
 
-                    let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
-                    let tool = self.tools.get(&call.name);
-                    let already_trusted = self.trusted.lock().unwrap().contains(&call.name);
+                let (sequential, concurrent): (Vec<&ToolCall>, Vec<&ToolCall>) = tool_calls.iter().partition(|c| self.needs_ui_turn(&c.name));
 
-                    let approved = match tool {
-                        Some(t) if t.requires_confirmation() && !already_trusted => {
-                            let description = t.confirmation_description(&args, &ctx);
-                            match self.confirm(&call.name, description).await {
-                                ConfirmDecision::Once => true,
-                                ConfirmDecision::Always => {
-                                    self.trusted.lock().unwrap().insert(call.name.clone());
-                                    true
-                                }
-                                ConfirmDecision::Deny => false,
-                            }
-                        }
-                        _ => true,
-                    };
+                let mut results: HashMap<String, (String, bool)> = HashMap::new();
+                let concurrent_outcomes = join_all(concurrent.iter().map(|call| self.run_tool_call(call, &ctx, &bus))).await;
+                for (call, outcome) in concurrent.into_iter().zip(concurrent_outcomes) {
+                    results.insert(call.id.clone(), outcome);
+                }
+                for call in sequential {
+                    let outcome = self.run_tool_call(call, &ctx, &bus).await;
+                    results.insert(call.id.clone(), outcome);
+                }
 
-                    let result_str = if !approved {
-                        let _ = bus.publish(Event::ActionRejected(call.id.clone()));
-                        format!("User declined to run tool '{}'.", call.name)
-                    } else {
-                        let _ = bus.publish(Event::ActionApproved(call.id.clone()));
-                        match tool {
-                            Some(t) => match t.execute(args, &ctx).await {
-                                Ok(res) => res,
-                                Err(e) => format!("Error executing {}: {}", call.name, e),
-                            },
-                            None => format!("Error: tool {} not found", call.name),
-                        }
-                    };
-
-                    let success = approved && !result_str.starts_with("Error");
+                // Publish/persist in the model's original call order,
+                // regardless of which order the calls actually finished in.
+                for call in &tool_calls {
+                    let (result_str, success) = results.remove(&call.id).unwrap_or_else(|| ("Error: tool result missing".to_string(), false));
                     let _ = bus.publish(Event::ActionFinished { id: call.id.clone(), result: result_str.clone(), success });
 
-                    // Push tool result
                     let tool_msg = Message::tool_result(call.id.clone(), call.name.clone(), result_str);
                     {
                         let mut st = state.write().await;

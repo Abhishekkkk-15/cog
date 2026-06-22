@@ -459,6 +459,163 @@ async fn executor_node_drains_a_steering_message_into_the_conversation_before_th
     assert!(steering.lock().unwrap().is_empty(), "the queue should be drained, not left for a future task to pick up twice");
 }
 
+struct SlowEchoTool;
+
+#[async_trait::async_trait]
+impl cog::tools::Tool for SlowEchoTool {
+    fn name(&self) -> &str {
+        "slow_echo"
+    }
+
+    fn description(&self) -> &str {
+        "Sleeps briefly then echoes its input — test-only tool used to measure whether independent tool calls run concurrently."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]})
+    }
+
+    async fn execute(&self, args: serde_json::Value, _ctx: &cog::tools::ToolContext) -> Result<String, cog::tools::ToolError> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok(args.get("value").and_then(serde_json::Value::as_str).unwrap_or("").to_string())
+    }
+}
+
+/// Two calls to a 200ms tool in the same round, neither requiring
+/// confirmation, should overlap rather than run back to back — sequential
+/// execution would take >=400ms; concurrent execution should finish well
+/// under that.
+#[tokio::test]
+async fn executor_node_runs_independent_tool_calls_concurrently() {
+    let dir = tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(SlowEchoTool));
+    let tools = Arc::new(registry);
+
+    let provider = Arc::new(DummyProvider::scripted(vec![
+        ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: vec![
+                    ToolCall { id: "call1".into(), name: "slow_echo".into(), arguments: r#"{"value": "a"}"#.into() },
+                    ToolCall { id: "call2".into(), name: "slow_echo".into(), arguments: r#"{"value": "b"}"#.into() },
+                ],
+                tool_call_id: None,
+                name: None,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+        },
+        ChatResponse {
+            message: Message { role: Role::Assistant, content: Some("done".into()), ..Default::default() },
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]));
+
+    let bus = EventBus::new(32);
+    let state = AgentState::new();
+    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), None, false, None, no_trust(), no_snapshots(), no_steering());
+    let mut bus_rx = bus.subscribe();
+    let exec_rx = bus.subscribe();
+
+    let exec_bus = bus.clone();
+    let exec_state = state.clone();
+    tokio::spawn(async move { executor.start(exec_bus, exec_rx, exec_state).await });
+
+    state.write().await.conversation.push(Message::user("run both"));
+    let started = std::time::Instant::now();
+    let _ = bus.publish(Event::ContextReady("t1".into()));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match bus_rx.recv().await {
+                Ok(Event::ExecutionFinished { .. }) => break,
+                Ok(_) => continue,
+                Err(_) => panic!("bus closed before ExecutionFinished"),
+            }
+        }
+    })
+    .await
+    .expect("executor should finish within 5s");
+
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_millis(350), "two 200ms tool calls should overlap, not run back to back (took {elapsed:?})");
+}
+
+/// Two *confirmation-gated* calls in the same round must still each get
+/// answered correctly — these stay in the sequential batch (one UI prompt
+/// at a time) even though independent non-gated calls now run concurrently.
+#[tokio::test]
+async fn executor_node_confirms_two_gated_calls_in_the_same_round() {
+    let dir = tempdir().unwrap();
+    let tools = Arc::new(ToolRegistry::new());
+    let provider = Arc::new(DummyProvider::scripted(vec![
+        ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: vec![
+                    ToolCall { id: "call1".into(), name: "write_file".into(), arguments: serde_json::json!({"path": "a.txt", "content": "a"}).to_string() },
+                    ToolCall { id: "call2".into(), name: "write_file".into(), arguments: serde_json::json!({"path": "b.txt", "content": "b"}).to_string() },
+                ],
+                tool_call_id: None,
+                name: None,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+        },
+        ChatResponse {
+            message: Message { role: Role::Assistant, content: Some("done".into()), ..Default::default() },
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]));
+
+    let bus = EventBus::new(32);
+    let state = AgentState::new();
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<AgentToUi>();
+
+    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), Some(ui_tx), false, None, no_trust(), no_snapshots(), no_steering());
+    let mut bus_rx = bus.subscribe();
+    let exec_rx = bus.subscribe();
+
+    let exec_bus = bus.clone();
+    let exec_state = state.clone();
+    tokio::spawn(async move { executor.start(exec_bus, exec_rx, exec_state).await });
+
+    let prompt_count = Arc::new(AtomicUsize::new(0));
+    let prompt_count_clone = prompt_count.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = ui_rx.recv().await {
+            if let AgentToUi::ConfirmRequest { respond_to, .. } = msg {
+                prompt_count_clone.fetch_add(1, Ordering::SeqCst);
+                let _ = respond_to.send(ConfirmDecision::Once);
+            }
+        }
+    });
+
+    state.write().await.conversation.push(Message::user("write both"));
+    let _ = bus.publish(Event::ContextReady("t1".into()));
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match bus_rx.recv().await {
+                Ok(Event::ExecutionFinished { .. }) => break,
+                Ok(_) => continue,
+                Err(_) => panic!("bus closed before ExecutionFinished"),
+            }
+        }
+    })
+    .await
+    .expect("executor should finish within 10s");
+
+    assert_eq!(prompt_count.load(Ordering::SeqCst), 2);
+    assert!(dir.path().join("a.txt").exists());
+    assert!(dir.path().join("b.txt").exists());
+}
+
 /// Exercises the real stdin y/N fallback in `ExecutorNode::confirm()` — the
 /// path used by `cog run` with no TUI wired (no `ui_tx`) and without
 /// `--yes`. Reads the actual process stdin rather than a mock, so it's

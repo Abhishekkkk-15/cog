@@ -37,29 +37,40 @@ impl Tool for ReadFileTool {
         })
     }
 
+    // Runs on tokio's blocking thread pool rather than inline: `std::fs`
+    // calls have no await point, so running them inline never actually
+    // overlaps with other tool calls in the same round even when dispatched
+    // via `join_all` — each one runs to completion the moment it's first
+    // polled, with nothing to interleave. `spawn_blocking` gets real
+    // OS-thread parallelism instead, independent of yield points.
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
         let params: ReadFileParams = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-        let full_path = ctx.cwd.join(&params.path);
-        let content = std::fs::read_to_string(&full_path)?;
+        let cwd = ctx.cwd.clone();
+        tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
+            let full_path = cwd.join(&params.path);
+            let content = std::fs::read_to_string(&full_path)?;
 
-        let lines: Vec<&str> = content.lines().collect();
-        if lines.is_empty() {
-            return Ok(String::new());
-        }
-        let start = params.start_line.unwrap_or(1).max(1);
-        let end = params.end_line.unwrap_or(lines.len()).min(lines.len());
-        if start > end {
-            return Ok(String::new());
-        }
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.is_empty() {
+                return Ok(String::new());
+            }
+            let start = params.start_line.unwrap_or(1).max(1);
+            let end = params.end_line.unwrap_or(lines.len()).min(lines.len());
+            if start > end {
+                return Ok(String::new());
+            }
 
-        let mut out = String::new();
-        for (i, line) in lines[start - 1..end].iter().enumerate() {
-            out.push_str(&format!("{:>6}: {}\n", start + i, line));
-        }
-        if out.len() > MAX_OUTPUT_CHARS {
-            out.truncate(MAX_OUTPUT_CHARS);
-            out.push_str("\n... [truncated]");
-        }
-        Ok(out)
+            let mut out = String::new();
+            for (i, line) in lines[start - 1..end].iter().enumerate() {
+                out.push_str(&format!("{:>6}: {}\n", start + i, line));
+            }
+            if out.len() > MAX_OUTPUT_CHARS {
+                out.truncate(MAX_OUTPUT_CHARS);
+                out.push_str("\n... [truncated]");
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?
     }
 }

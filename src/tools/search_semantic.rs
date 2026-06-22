@@ -45,35 +45,45 @@ impl Tool for SearchSemanticTool {
         })
     }
 
+    // See read_file's execute() for why this runs via spawn_blocking rather
+    // than inline: walking the tree and parsing each file has no await
+    // point of its own, so it wouldn't actually overlap with other tool
+    // calls in the same round without being moved onto a real OS thread.
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
         let params: SearchSemanticParams = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-        let root = ctx.cwd.join(&params.path);
-        let mut results = Vec::new();
+        let cwd = ctx.cwd.clone();
 
-        for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
-            if results.len() >= MAX_RESULTS {
-                break;
+        tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
+            let root = cwd.join(&params.path);
+            let mut results = Vec::new();
+
+            for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+                if results.len() >= MAX_RESULTS {
+                    break;
+                }
+                if !entry.file_type().is_file() || is_ignored(entry.path()) {
+                    continue;
+                }
+                let Some(lang) = lang_spec_for(entry.path()) else { continue };
+                let Ok(source) = std::fs::read_to_string(entry.path()) else { continue };
+
+                let mut parser = Parser::new();
+                if parser.set_language(&lang.language).is_err() {
+                    continue;
+                }
+                let Some(tree) = parser.parse(&source, None) else { continue };
+
+                let rel = entry.path().strip_prefix(&cwd).unwrap_or(entry.path()).to_path_buf();
+                collect_symbols(tree.root_node(), &source, lang.symbol_kinds, &params.query, &rel, &mut results);
             }
-            if !entry.file_type().is_file() || is_ignored(entry.path()) {
-                continue;
+
+            if results.is_empty() {
+                return Ok("no matching symbols found".to_string());
             }
-            let Some(lang) = lang_spec_for(entry.path()) else { continue };
-            let Ok(source) = std::fs::read_to_string(entry.path()) else { continue };
-
-            let mut parser = Parser::new();
-            if parser.set_language(&lang.language).is_err() {
-                continue;
-            }
-            let Some(tree) = parser.parse(&source, None) else { continue };
-
-            let rel = entry.path().strip_prefix(&ctx.cwd).unwrap_or(entry.path()).to_path_buf();
-            collect_symbols(tree.root_node(), &source, lang.symbol_kinds, &params.query, &rel, &mut results);
-        }
-
-        if results.is_empty() {
-            return Ok("no matching symbols found".to_string());
-        }
-        Ok(results.join("\n"))
+            Ok(results.join("\n"))
+        })
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?
     }
 }
 

@@ -41,40 +41,49 @@ impl Tool for ListDirTool {
         })
     }
 
+    // See read_file's execute() for why this runs via spawn_blocking rather
+    // than inline: directory walking has no await point of its own, so it
+    // wouldn't actually overlap with other tool calls in the same round
+    // without being moved onto a real OS thread.
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
         let params: ListDirParams = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-        let root = ctx.cwd.join(&params.path);
-        let mut lines = Vec::new();
+        let cwd = ctx.cwd.clone();
+        tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
+            let root = cwd.join(&params.path);
+            let mut lines = Vec::new();
 
-        if params.recursive {
-            for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
-                if lines.len() >= MAX_ENTRIES {
-                    break;
+            if params.recursive {
+                for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+                    if lines.len() >= MAX_ENTRIES {
+                        break;
+                    }
+                    let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+                    if rel.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let marker = if entry.file_type().is_dir() { "/" } else { "" };
+                    lines.push(format!("{}{marker}", rel.display()));
                 }
-                let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-                if rel.as_os_str().is_empty() {
-                    continue;
+            } else {
+                let mut entries: Vec<_> = std::fs::read_dir(&root)?.filter_map(|e| e.ok()).collect();
+                entries.sort_by_key(|e| e.file_name());
+                for entry in entries {
+                    if lines.len() >= MAX_ENTRIES {
+                        break;
+                    }
+                    let marker = if entry.path().is_dir() { "/" } else { "" };
+                    lines.push(format!("{}{marker}", entry.file_name().to_string_lossy()));
                 }
-                let marker = if entry.file_type().is_dir() { "/" } else { "" };
-                lines.push(format!("{}{marker}", rel.display()));
             }
-        } else {
-            let mut entries: Vec<_> = std::fs::read_dir(&root)?.filter_map(|e| e.ok()).collect();
-            entries.sort_by_key(|e| e.file_name());
-            for entry in entries {
-                if lines.len() >= MAX_ENTRIES {
-                    break;
-                }
-                let marker = if entry.path().is_dir() { "/" } else { "" };
-                lines.push(format!("{}{marker}", entry.file_name().to_string_lossy()));
-            }
-        }
 
-        let truncated = lines.len() >= MAX_ENTRIES;
-        let mut out = lines.join("\n");
-        if truncated {
-            out.push_str("\n... [truncated]");
-        }
-        Ok(out)
+            let truncated = lines.len() >= MAX_ENTRIES;
+            let mut out = lines.join("\n");
+            if truncated {
+                out.push_str("\n... [truncated]");
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?
     }
 }
