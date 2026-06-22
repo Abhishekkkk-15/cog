@@ -32,10 +32,16 @@ pub struct Agent {
     memory: Option<Arc<tokio::sync::Mutex<MemoryManager>>>,
     ui_tx: Option<mpsc::UnboundedSender<AgentToUi>>,
     ui_rx: Option<mpsc::UnboundedReceiver<UiToAgent>>,
-    
+
     // New architecture fields
     pub bus: EventBus,
     pub state: Arc<tokio::sync::RwLock<AgentState>>,
+    /// Messages typed while a task is already executing, queued here
+    /// instead of going through `GoalReceived` — `ExecutorNode` drains this
+    /// into `state.conversation` at the top of each round (a safe boundary
+    /// between rounds, never mid-tool-call), so the model sees the steer on
+    /// its next turn without a whole new plan/milestone being spun up for it.
+    pub steering: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Agent {
@@ -51,6 +57,7 @@ impl Agent {
             ui_rx: None,
             bus: EventBus::new(100),
             state: AgentState::new(),
+            steering: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -60,13 +67,24 @@ impl Agent {
         self
     }
 
-    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+    /// Appends every registered tool's `prompt_guidelines()` after the given
+    /// base prompt — narrow, tool-specific usage tips assembled from the
+    /// actual registered `ToolRegistry`, rather than duplicated by hand into
+    /// one large prompt string. `self.tools` is already set by `new()` by
+    /// the time this builder method runs, so this needs no extra argument.
+    pub fn with_system_prompt(self, prompt: impl Into<String>) -> Self {
+        let mut full = prompt.into();
+        let guidelines = self.tools.prompt_guidelines();
+        if !guidelines.is_empty() {
+            full.push_str("\n\n");
+            full.push_str(&guidelines);
+        }
         // Need to use blocking write here since we're in a synchronous builder method
         // Or we can just use a sync Mutex/RwLock, but we have tokio RwLock.
         // For builder, we can use try_write or block_on.
         // Actually, we can use `try_write` since it's uncontended during builder phase.
         if let Ok(mut st) = self.state.try_write() {
-            st.conversation.push(Message::system(prompt));
+            st.conversation.push(Message::system(full));
         }
         self
     }
@@ -117,6 +135,7 @@ impl Agent {
                 self.memory.clone(),
                 trusted,
                 snapshots.clone(),
+                self.steering.clone(),
             )),
             Box::new(VerifierNode::new(self.cwd.clone(), self.provider.clone(), self.model.clone())),
             Box::new(ReflectorNode::new(self.provider.clone(), self.model.clone())),

@@ -24,6 +24,10 @@ fn no_snapshots() -> FileSnapshots {
     Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn no_steering() -> Arc<std::sync::Mutex<Vec<String>>> {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
 struct ConstEmbedder;
 
 #[async_trait::async_trait]
@@ -54,7 +58,7 @@ async fn executor_node_persists_messages_to_memory() {
     let run_id = state.read().await.run_id.clone();
     memory.lock().await.create_session(&run_id, "test-project").await.unwrap();
 
-    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), None, false, Some(memory.clone()), no_trust(), no_snapshots());
+    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), None, false, Some(memory.clone()), no_trust(), no_snapshots(), no_steering());
     let mut bus_rx = bus.subscribe();
     let exec_rx = bus.subscribe();
 
@@ -221,7 +225,7 @@ async fn executor_node_respects_a_confirmation_rejection() {
     let state = AgentState::new();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<AgentToUi>();
 
-    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), Some(ui_tx), false, None, no_trust(), no_snapshots());
+    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), Some(ui_tx), false, None, no_trust(), no_snapshots(), no_steering());
     let mut bus_rx = bus.subscribe();
     let exec_rx = bus.subscribe();
 
@@ -295,7 +299,7 @@ async fn executor_node_remembers_always_trust_for_the_rest_of_the_session() {
     let state = AgentState::new();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<AgentToUi>();
 
-    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), Some(ui_tx), false, None, no_trust(), no_snapshots());
+    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), Some(ui_tx), false, None, no_trust(), no_snapshots(), no_steering());
     let mut bus_rx = bus.subscribe();
     let exec_rx = bus.subscribe();
 
@@ -393,6 +397,68 @@ async fn agent_run_reaches_run_finished_with_a_real_tool_call() {
     assert!(success, "a real tool call should pass the build check and the (inconclusive-but-allowed) goal-completion check");
 }
 
+/// Simulates the TUI pushing a steering message into the shared queue while
+/// round 1 (a real tool call) is still in flight — exercises the same path
+/// `tui/mod.rs` uses for `UiToAgent::SteeringMessage`. The message should
+/// land in `state.conversation` before round 2's request is built, and the
+/// queue should end up drained (not left for some later task to re-inject).
+#[tokio::test]
+async fn executor_node_drains_a_steering_message_into_the_conversation_before_the_next_round() {
+    let dir = tempdir().unwrap();
+    let tools = Arc::new(ToolRegistry::new());
+    let provider = Arc::new(DummyProvider::scripted(vec![
+        ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: vec![ToolCall { id: "call1".into(), name: "list_dir".into(), arguments: "{}".into() }],
+                tool_call_id: None,
+                name: None,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+        },
+        ChatResponse {
+            message: Message { role: Role::Assistant, content: Some("done".into()), ..Default::default() },
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]));
+
+    let bus = EventBus::new(32);
+    let state = AgentState::new();
+    let steering = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.path().to_path_buf(), None, false, None, no_trust(), no_snapshots(), steering.clone());
+    let mut bus_rx = bus.subscribe();
+    let exec_rx = bus.subscribe();
+
+    let exec_bus = bus.clone();
+    let exec_state = state.clone();
+    tokio::spawn(async move { executor.start(exec_bus, exec_rx, exec_state).await });
+
+    state.write().await.conversation.push(Message::user("list the files"));
+    let _ = bus.publish(Event::ContextReady("t1".into()));
+    steering.lock().unwrap().push("actually, also check for a README".to_string());
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match bus_rx.recv().await {
+                Ok(Event::ExecutionFinished { .. }) => break,
+                Ok(_) => continue,
+                Err(_) => panic!("bus closed before ExecutionFinished"),
+            }
+        }
+    })
+    .await
+    .expect("executor should finish within 10s");
+
+    let messages = state.read().await.conversation.messages.clone();
+    let steered = messages.iter().find(|m| m.role == Role::User && m.content.as_deref() == Some("actually, also check for a README"));
+    assert!(steered.is_some(), "steering message should have been injected into the conversation");
+    assert!(steering.lock().unwrap().is_empty(), "the queue should be drained, not left for a future task to pick up twice");
+}
+
 /// Exercises the real stdin y/N fallback in `ExecutorNode::confirm()` — the
 /// path used by `cog run` with no TUI wired (no `ui_tx`) and without
 /// `--yes`. Reads the actual process stdin rather than a mock, so it's
@@ -416,7 +482,7 @@ async fn run_command_via_stdin_confirmation(dir: &std::path::Path) -> AgentState
 
     let bus = EventBus::new(32);
     let state = AgentState::new();
-    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.to_path_buf(), None, false, None, no_trust(), no_snapshots());
+    let executor = ExecutorNode::new(provider, tools, "test-model".into(), dir.to_path_buf(), None, false, None, no_trust(), no_snapshots(), no_steering());
     let mut bus_rx = bus.subscribe();
     let exec_rx = bus.subscribe();
 

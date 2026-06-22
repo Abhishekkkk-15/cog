@@ -28,6 +28,12 @@ pub struct ExecutorNode {
     /// finished run's snapshots never bleed into the next prompt in a
     /// long-lived TUI session.
     snapshots: FileSnapshots,
+    /// Messages the TUI queues here when the user types while a task is
+    /// already running (see `Agent::steering`). Drained into the
+    /// conversation only at the top of a round — never mid-tool-call, which
+    /// would otherwise interleave a `user` message between an assistant's
+    /// `tool_calls` and its results and break the expected message ordering.
+    steering: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl ExecutorNode {
@@ -41,8 +47,9 @@ impl ExecutorNode {
         memory: Option<Arc<tokio::sync::Mutex<MemoryManager>>>,
         trusted: Arc<std::sync::Mutex<HashSet<String>>>,
         snapshots: FileSnapshots,
+        steering: Arc<std::sync::Mutex<Vec<String>>>,
     ) -> Self {
-        Self { provider, tools, model, cwd, ui_tx, auto_approve, memory, trusted, snapshots }
+        Self { provider, tools, model, cwd, ui_tx, auto_approve, memory, trusted, snapshots, steering }
     }
 
     /// Confirmation round-trip: via the TUI channel if wired, otherwise
@@ -100,6 +107,23 @@ impl Node for ExecutorNode {
                     break;
                 }
                 round += 1;
+
+                // Pick up anything the user typed while this task was
+                // already running. Draining here — top of the round, after
+                // the previous round's tool results are already pushed and
+                // before this round's request is built — is the only point
+                // where inserting a `user` message can't end up between an
+                // assistant's `tool_calls` and its results.
+                let steered: Vec<String> = {
+                    let mut queue = self.steering.lock().unwrap();
+                    queue.drain(..).collect()
+                };
+                if !steered.is_empty() {
+                    let mut st = state.write().await;
+                    for text in steered {
+                        st.conversation.push(Message::user(text));
+                    }
+                }
 
                 // Summarize the middle of the conversation once it's grown
                 // large enough, before spending tokens on this round's request.

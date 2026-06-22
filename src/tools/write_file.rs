@@ -40,6 +40,10 @@ impl Tool for WriteFileTool {
         true
     }
 
+    fn prompt_guidelines(&self) -> Option<&str> {
+        Some("write_file: overwrites the entire file. Prefer edit_file for changes to a file that already exists; reserve write_file for creating a new file or replacing one's full contents.")
+    }
+
     fn confirmation_description(&self, args: &Value, ctx: &ToolContext) -> String {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
         let new_content = args.get("content").and_then(Value::as_str).unwrap_or("");

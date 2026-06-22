@@ -85,6 +85,14 @@ pub trait Tool: Send + Sync {
     fn confirmation_description(&self, args: &Value, _ctx: &ToolContext) -> String {
         args.to_string()
     }
+    /// Optional short, model-facing usage tip for this specific tool,
+    /// appended to the system prompt when the tool is registered. Keep it
+    /// narrow — this tool's own failure modes and how to avoid them, not
+    /// general engineering advice (that belongs in the base system prompt,
+    /// not duplicated per tool).
+    fn prompt_guidelines(&self) -> Option<&str> {
+        None
+    }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError>;
 }
 
@@ -140,5 +148,41 @@ impl ToolRegistry {
 
     pub fn requires_confirmation(&self, name: &str) -> bool {
         self.tools.get(name).map(|t| t.requires_confirmation()).unwrap_or(false)
+    }
+
+    /// Assembles every registered tool's `prompt_guidelines()` into one
+    /// block, sorted by tool name for a deterministic order regardless of
+    /// `HashMap` iteration — empty if no registered tool has any.
+    pub fn prompt_guidelines(&self) -> String {
+        let mut entries: Vec<(&str, &str)> = self.tools.values().filter_map(|t| t.prompt_guidelines().map(|g| (t.name(), g))).collect();
+        entries.sort_by_key(|(name, _)| *name);
+        entries.into_iter().map(|(_, g)| g).collect::<Vec<_>>().join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_guidelines_includes_known_tools_in_deterministic_sorted_order() {
+        let registry = ToolRegistry::new();
+        let guidelines = registry.prompt_guidelines();
+
+        assert!(guidelines.contains("edit_file:"));
+        assert!(guidelines.contains("write_file:"));
+        assert!(guidelines.contains("run_command:"));
+
+        let edit_pos = guidelines.find("edit_file:").unwrap();
+        let run_pos = guidelines.find("run_command:").unwrap();
+        let write_pos = guidelines.find("write_file:").unwrap();
+        assert!(edit_pos < run_pos && run_pos < write_pos, "expected alphabetical order by tool name");
+    }
+
+    #[test]
+    fn prompt_guidelines_is_empty_for_a_registry_with_no_guideline_tools() {
+        let mut registry = ToolRegistry { tools: HashMap::new() };
+        registry.register(Box::new(super::search_regex::SearchRegexTool));
+        assert_eq!(registry.prompt_guidelines(), "");
     }
 }

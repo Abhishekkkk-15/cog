@@ -160,8 +160,16 @@ fn handle_text_key(app: &mut App, key: KeyEvent) -> Option<UiToAgent> {
                 return parse_command(rest);
             }
             app.mode = InputMode::Normal;
-            app.push_user_line(text.clone());
-            Some(UiToAgent::UserPrompt(text))
+            if app.running {
+                // A task is already executing — redirect it instead of
+                // starting a second, unrelated plan on top of it.
+                app.push_steering_line(text.clone());
+                Some(UiToAgent::SteeringMessage(text))
+            } else {
+                app.push_user_line(text.clone());
+                app.running = true;
+                Some(UiToAgent::UserPrompt(text))
+            }
         }
         KeyCode::Esc => {
             app.input.reset();

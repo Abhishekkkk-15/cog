@@ -24,6 +24,10 @@ pub enum AgentToUi {
 /// UI (input handling) -> Agent (background tokio task) events.
 pub enum UiToAgent {
     UserPrompt(String),
+    /// Typed while a task was already running — queued for `ExecutorNode`
+    /// to inject into the current task's conversation, rather than
+    /// `GoalReceived`'s "decompose a whole new plan" path.
+    SteeringMessage(String),
     SlashCommand(SlashCommand),
     RequestMemorySnapshot,
     Quit,
@@ -82,6 +86,10 @@ pub enum RightPanel {
 /// lifecycle, system notes) rather than conversation/provider state.
 pub enum ChatLine {
     User(String),
+    /// A message typed and injected while a task was already running —
+    /// rendered distinctly from `User` so it's clear it didn't start a new
+    /// plan, just redirected the in-flight one.
+    Steering(String),
     Assistant(String),
     ToolCall { id: String, name: String, args_preview: String, result_preview: Option<String>, success: Option<bool> },
     SystemNote(String),
@@ -200,6 +208,10 @@ pub struct App {
     pub should_quit: bool,
     pub bus: crate::bus::EventBus,
     pub state: std::sync::Arc<tokio::sync::RwLock<crate::state::AgentState>>,
+    /// True from the moment a goal is submitted until `RunFinished` —
+    /// while true, Enter sends a steering message instead of starting a
+    /// second, unrelated goal/plan on top of the one already executing.
+    pub running: bool,
 }
 
 impl App {
@@ -220,11 +232,17 @@ impl App {
             should_quit: false,
             bus,
             state,
+            running: false,
         }
     }
 
     pub fn push_user_line(&mut self, text: String) {
         self.lines.push(ChatLine::User(text));
+        self.scroll_offset = 0;
+    }
+
+    pub fn push_steering_line(&mut self, text: String) {
+        self.lines.push(ChatLine::Steering(text));
         self.scroll_offset = 0;
     }
 
@@ -303,6 +321,7 @@ impl App {
                 let msg = if success { "Run finished".to_string() } else { "Run failed after exhausting retries".to_string() };
                 self.lines.push(ChatLine::SystemNote(msg));
                 self.status.connection = ConnectionStatus::Idle;
+                self.running = false;
             }
             _ => {}
         }

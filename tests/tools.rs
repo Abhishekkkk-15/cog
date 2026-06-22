@@ -162,7 +162,27 @@ async fn edit_file_rejects_an_ambiguous_match() {
 
     let result = tool.execute(json!({"path": "f.txt", "old_string": "dup", "new_string": "x"}), &context).await;
     let err = result.expect_err("a match occurring twice should fail");
-    assert!(err.to_string().contains("multiple"));
+    assert!(err.to_string().contains("2 locations"));
+}
+
+/// The file has a real curly/smart quote (as an editor's autocorrect or a
+/// copy-paste from a rendered doc would produce); the model's old_string
+/// uses the plain ASCII apostrophe instead. The exact match fails, but the
+/// lookalike-normalized fallback should still find the unique match and
+/// replace the right span in the *original* (still-curly-quoted) text.
+#[tokio::test]
+async fn edit_file_falls_back_to_a_lookalike_normalized_match() {
+    let dir = tempdir().unwrap();
+    let old = "it\u{2019}s working\nline2\n";
+    std::fs::write(dir.path().join("f.txt"), old).unwrap();
+
+    let registry = ToolRegistry::new();
+    let tool = registry.get("edit_file").unwrap();
+    let context = ctx(dir.path().to_path_buf());
+
+    let result = tool.execute(json!({"path": "f.txt", "old_string": "it's working", "new_string": "it's CHANGED"}), &context).await.unwrap();
+    assert!(result.contains("edited"));
+    assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "it's CHANGED\nline2\n");
 }
 
 #[tokio::test]

@@ -11,6 +11,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     for line in &app.lines {
         match line {
             ChatLine::User(text) => lines.push(Line::from(vec![Span::styled("● You: ", Style::new().fg(Color::Green).bold()), Span::raw(text.clone())])),
+            ChatLine::Steering(text) => lines.push(Line::from(vec![Span::styled("↳ You (steering): ", Style::new().fg(Color::Cyan).bold()), Span::raw(text.clone())])),
             ChatLine::Assistant(text) => {
                 lines.push(Line::from(vec![Span::styled("○ Cog: ", Style::new().fg(Color::Blue).bold())]));
                 let md_text = tui_markdown::from_str(text);

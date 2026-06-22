@@ -49,6 +49,10 @@ impl Tool for RunCommandTool {
         true
     }
 
+    fn prompt_guidelines(&self) -> Option<&str> {
+        Some("run_command: avoid long-running or interactive commands (servers, watchers, REPLs, anything waiting on stdin) — they will hit the timeout and waste a round instead of completing.")
+    }
+
     fn confirmation_description(&self, args: &Value, _ctx: &ToolContext) -> String {
         let command = args.get("command").and_then(Value::as_str).unwrap_or("?");
         match args.get("cwd").and_then(Value::as_str) {

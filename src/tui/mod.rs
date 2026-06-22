@@ -81,7 +81,8 @@ pub async fn run_tui(
     agent.spawn_nodes().await;
     let bus = agent.bus.clone();
     let state = agent.state.clone();
-    let agent_task = tokio::spawn(async move { 
+    let steering = agent.steering.clone();
+    let agent_task = tokio::spawn(async move {
         // Legacy run_interactive is removed. Keep task alive.
         tokio::time::sleep(tokio::time::Duration::from_secs(99999)).await;
     });
@@ -136,6 +137,7 @@ pub async fn run_tui(
                             }
                             match action {
                                 UiToAgent::UserPrompt(prompt) => { let _ = bus.publish(crate::state::Event::GoalReceived(prompt)); },
+                                UiToAgent::SteeringMessage(text) => { steering.lock().unwrap().push(text); },
                                 UiToAgent::SlashCommand(cmd) => {
                                     match cmd {
                                         SlashCommand::Auth { provider, key } => {
